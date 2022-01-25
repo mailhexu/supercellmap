@@ -1,1 +1,1 @@
-from supercell import SupercellMaker, map_to_primitive
+from .supercell import SupercellMaker, map_to_primitive
