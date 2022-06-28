@@ -5,6 +5,8 @@ import numpy as np
 from collections import OrderedDict, defaultdict
 from itertools import product
 from functools import lru_cache
+from ase.build import make_supercell
+from ase.atoms import Atoms
 
 
 def close_to_int(x, tol=1e-4):
@@ -12,6 +14,7 @@ def close_to_int(x, tol=1e-4):
 
 
 class SupercellMaker(object):
+
     def __init__(self, sc_matrix, center=False):
         """
         a helper class for making supercells.
@@ -310,8 +313,36 @@ class SupercellMaker(object):
             c = self.sc_vec_dict[Rshift]
             ii = c * n_basis
             jj = pair_ind * n_basis
-            sc_RHdict[tuple(sc_part)][ii:ii + n_basis,
-                                      jj:jj + n_basis] += H
+            sc_RHdict[tuple(sc_part)][ii:ii + n_basis, jj:jj + n_basis] += H
+        return sc_RHdict
+
+    def sc_H_RpRk_notrans(self, Rplist, Rklist, n_basis, Rpprime, H):
+        """
+        For a given perturbation at Rp',
+        <Rm|Rp'=Rp+Rm|Rk+Rm>
+        =H(Rp,Rk)=<0|Rp|Rk> is a matrix of nbasis*nbasis
+        First: Rm = Rp'-Rp, Rk+Rm = Rp'-Rp+Rm
+        Input: Rplist, Rklist, H
+        H: [iRg, iRk, ibasis, ibasis]
+        """
+        sc_RHdict = defaultdict(lambda: np.zeros(
+            (n_basis * self.ncell, n_basis * self.ncell), dtype=H.dtype))
+        for iRp, Rp in enumerate(Rplist):
+            Rm = np.array(Rpprime) - np.array(Rp)
+
+            sc_part_i, pair_ind_i = self._sc_R_to_pair_ind(tuple(np.array(Rm)))
+            ii = pair_ind_i * n_basis
+            if tuple(sc_part_i) == (0, 0, 0):
+                for iRk, Rk in enumerate(Rklist):
+                    sc_part_j, pair_ind_j = self._sc_R_to_pair_ind(
+                        tuple(np.array(Rk) + np.array(Rm)))
+                    jj = pair_ind_j * n_basis
+                    sc_RHdict[tuple(sc_part_j)][ii:ii + n_basis, jj:jj +
+                                                n_basis] += H[iRp, iRk, :, :]
+                # elif tuple(sc_part_j) == (0, 0, 0):
+                #    sc_RHdict[tuple(-sc_part_j)][jj:jj + n_basis,
+                #                                 ii:ii + n_basis] += H[iRp, iRk, :, :].T.conj()
+
         return sc_RHdict
 
     def sc_atoms(self, atoms):
@@ -319,7 +350,6 @@ class SupercellMaker(object):
         This function is compatible with ase.build.make_supercell.
         They should produce the same result.
         """
-        from ase.atoms import Atoms
         sc_cell = self.sc_cell(atoms.get_cell())
         sc_pos = self.sc_pos(atoms.get_scaled_positions())
         sc_numbers = self.sc_trans_invariant(atoms.get_atomic_numbers())
@@ -361,8 +391,8 @@ class SupercellMaker(object):
             for i_basis, pos in enumerate(positions):
                 for j_basis, Tpos in enumerate(Tpositions):
                     dpos = Tpos - pos
-                    if close_to_int(dpos, tol_r) and (
-                            self._basis[i_basis] == self._basis[j_basis]):
+                    if close_to_int(dpos, tol_r) and (self._basis[i_basis]
+                                                      == self._basis[j_basis]):
                         indices[i, j_basis] = i_basis
 
         self._trans_rs = rs
@@ -408,6 +438,60 @@ def map_to_primitive(atoms, primitive_atoms, offset=(0, 0, 0)):
     return np.array(ilist, dtype=int), np.array(Rlist, dtype=int)
 
 
+def find_primitive_cell(atoms,
+                        sc_matrix,
+                        origin_atom_id=None,
+                        thr=1e-5,
+                        perfect=True):
+    """
+    Find a primitive cell atoms from the supercell atom structure.
+    :param atoms: the supercell structure.
+    :param sc_matrix: the matrix which maps the primitive cell to supercell.
+    :param origin: the origin of the primitive cell.
+    :param thr: the atoms which the reduced position is within -thr to 1.0+thr are considered as inside the primitive atoms
+    :params perfect: True|False, whether the primitive cell should contains the same number of atoms .
+    :returns: (patoms, selected)
+    patoms: the primitive cell atoms
+    selected: the selected indices of the atoms in the supercell.
+    """
+    scell = atoms.get_cell().array
+    inv_scmat = np.linalg.inv(sc_matrix.T)
+    pcell = inv_scmat @ scell
+    print(f"{inv_scmat=}")
+
+    xcart = atoms.get_positions()
+    xred = atoms.get_scaled_positions()
+    if origin_atom_id is not None:
+        origin = xred[origin_atom_id]
+    else:
+        origin = np.zeros(3)
+    # check if some atom is exactly at the origin.
+    # if so, shift the positions by thr so that this atom is inside the cell
+    if np.any(np.linalg.norm(xred - origin[None, :], axis=1) < thr):
+        xred += thr
+
+    sc_xred = xred @ sc_matrix
+    #np.all(sc_xred<1 and sc_xred>=0.0)
+    #print(sc_xred<1)
+    x = np.logical_and(sc_xred < 1, sc_xred >= 0.0)
+    selected = np.where(np.all(x, axis=0))[0]
+    symbols = atoms.get_chemical_symbols()
+    psymbols = [symbols[i] for i in selected]
+    patoms = Atoms(symbols=psymbols, positions=xcart[selected], cell=pcell)
+    ncell = abs(np.linalg.det(sc_matrix))
+    natom= len(atoms)
+    if perfect:
+        assert len(symbols) == int(natom/ncell), "The number of atoms in the found primitive cell does not equal to natom in the supercell divided by the size of the cell"
+    return atoms, selected
+
+
+def test_find_primtive_cell():
+    atoms = Atoms('HO', positions=[[0, 0, 0], [0, 0.2, 0]], cell=[1, 1, 1])
+    sc_matrix = np.diag([1, 1, 3])
+    atoms2 = make_supercell(atoms, sc_matrix)
+    patoms = find_primitive_cell(atoms2, sc_matrix)
+
+
 def test():
     sc_mat = np.diag([1, 1, 3])
     #sc_mat[0, 1] = 2
@@ -435,4 +519,5 @@ def test():
 
 
 if __name__ == '__main__':
-    test()
+    #test()
+    test_find_primitive_cell()
